@@ -5,7 +5,9 @@ stores them, and updates per-account call statistics.
 
 It is in production. It is misbehaving.
 
-# Project Structur
+# Project Structure
+```text 
+.
 ├── cmd/
 │   └── server/
 │       └── ...
@@ -30,6 +32,7 @@ It is in production. It is misbehaving.
 ├── docker-compose.yml
 ├── go.mod
 └── go.sum
+```
 
 # Architecture Workflow
 ```text
@@ -54,6 +57,8 @@ Ingestion Service
 Redis
   |
   +--> Connected as part of the existing infrastructure
+
+```
 ## The incident
 
 Last week operations filed this:
