@@ -1,0 +1,87 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/convin/webhook-ingest/internal/config"
+	"github.com/convin/webhook-ingest/internal/httpapi"
+	"github.com/convin/webhook-ingest/internal/ingest"
+	"github.com/convin/webhook-ingest/internal/redisclient"
+	"github.com/convin/webhook-ingest/internal/stats"
+	"github.com/convin/webhook-ingest/internal/store"
+)
+
+const shutdownTimeout = 10 * time.Second
+
+func main() {
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	cfg := config.Load()
+	ctx := context.Background()
+
+	st, err := store.New(ctx, cfg.PostgresDSN, cfg.DBMaxConns)
+	if err != nil {
+		log.Error("connect postgres", "err", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
+	rdb, err := redisclient.New(ctx, cfg.RedisAddr)
+	if err != nil {
+		log.Error("connect redis", "err", err)
+		os.Exit(1)
+	}
+	defer func() { _ = rdb.Close() }()
+
+	// The in-memory stats cache starts empty on every process start, but the
+	// durable numbers already exist in account_stats. Seed the cache from
+	// them so /accounts/{id}/stats is correct immediately after a restart or
+	// deploy instead of reading zero until each account's next event.
+	cache := stats.NewCache()
+	durableStats, err := st.AllAccountStats(ctx)
+	if err != nil {
+		log.Error("load account stats", "err", err)
+		os.Exit(1)
+	}
+	for accountID, s := range durableStats {
+		cache.Set(accountID, stats.AccountStats{
+			CallCount:        s.CallCount,
+			TotalDurationSec: s.TotalDurationSec,
+		})
+	}
+
+	svc := ingest.New(st, cache, rdb, log)
+	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.NewRouter(svc, log)}
+
+	go func() {
+		log.Info("listening", "addr", cfg.HTTPAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("server stopped", "err", err)
+			os.Exit(1)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+
+	log.Info("shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("shutdown", "err", err)
+	}
+
+	// srv.Shutdown only waits for in-flight HTTP handlers, and the webhook
+	// handler returns as soon as Ingest hands recording processing off to a
+	// goroutine — so by the time Shutdown returns, recording work can still
+	// be running. Give it the remainder of the shutdown budget instead of
+	// letting the process exit out from under it.
+	svc.Wait(shutdownCtx)
+}
